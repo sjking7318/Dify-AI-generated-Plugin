@@ -41,6 +41,8 @@ from core.workflow.generator.prompts.node_builder_prompts import (
     format_mode_section,
     format_parallel_plan,
     format_start_inputs_section,
+    format_tool_schema_section,
+    format_variable_contract_section,
     get_node_builder_system_prompt,
 )
 from core.workflow.generator.prompts.node_builder_prompts import (
@@ -53,6 +55,7 @@ from core.workflow.generator.prompts.planner_prompts import (
     format_ideal_output_section,
     format_tool_catalogue_section,
 )
+from core.workflow.generator.tool_schema import ToolSchemaResolver
 from core.workflow.generator.types import (
     GraphDict,
     GraphViewportDict,
@@ -337,6 +340,7 @@ class WorkflowGenerator:
         ideal_output: str = "",
         tool_catalogue_text: str = "",
         installed_tools: set[tuple[str, str]] | None = None,
+        tool_schema_resolver: ToolSchemaResolver | None = None,
         current_graph: dict[str, Any] | None = None,
     ) -> WorkflowGenerateResultDict:
         """
@@ -392,6 +396,7 @@ class WorkflowGenerator:
             ideal_output=ideal_output,
             tool_catalogue_text=tool_catalogue_text,
             installed_tools=installed_tools,
+            tool_schema_resolver=tool_schema_resolver,
             current_graph=current_graph,
         ):
             if event_name == "result":
@@ -416,6 +421,7 @@ class WorkflowGenerator:
         ideal_output: str = "",
         tool_catalogue_text: str = "",
         installed_tools: set[tuple[str, str]] | None = None,
+        tool_schema_resolver: ToolSchemaResolver | None = None,
         current_graph: dict[str, Any] | None = None,
     ) -> Iterator[tuple[str, dict[str, Any]]]:
         """
@@ -439,6 +445,7 @@ class WorkflowGenerator:
             ideal_output=ideal_output,
             tool_catalogue_text=tool_catalogue_text,
             installed_tools=installed_tools,
+            tool_schema_resolver=tool_schema_resolver,
             current_graph=current_graph,
         )
 
@@ -456,6 +463,7 @@ class WorkflowGenerator:
         ideal_output: str = "",
         tool_catalogue_text: str = "",
         installed_tools: set[tuple[str, str]] | None = None,
+        tool_schema_resolver: ToolSchemaResolver | None = None,
         current_graph: dict[str, Any] | None = None,
     ) -> Iterator[tuple[str, dict[str, Any]]]:
         """
@@ -540,6 +548,7 @@ class WorkflowGenerator:
                 plan_edges=plan_edges,
                 tool_catalogue_text=tool_catalogue_text,
                 start_inputs=start_inputs,
+                tool_schema_resolver=tool_schema_resolver,
                 current_graph=current_graph,
             )
 
@@ -811,6 +820,7 @@ class WorkflowGenerator:
         plan_edges: list[dict[str, Any]],
         tool_catalogue_text: str,
         start_inputs: list[dict[str, Any]],
+        tool_schema_resolver: ToolSchemaResolver | None,
         current_graph: dict[str, Any] | None,
     ) -> GraphDict:
         """Build changed node configs concurrently and expand them into a graph.
@@ -854,6 +864,7 @@ class WorkflowGenerator:
                         plan_json=plan_json,
                         tool_catalogue_text=tool_catalogue_text,
                         start_inputs=start_inputs,
+                        tool_schema_resolver=tool_schema_resolver,
                         existing_node=existing_by_id.get(str(node.get("id"))),
                     ): str(node.get("id"))
                     for node in nodes_to_build
@@ -895,6 +906,7 @@ class WorkflowGenerator:
         plan_json: str,
         tool_catalogue_text: str,
         start_inputs: list[dict[str, Any]],
+        tool_schema_resolver: ToolSchemaResolver | None,
         existing_node: dict[str, Any] | None,
     ) -> dict[str, Any]:
         """Generate only the semantic config for one normalized plan node."""
@@ -912,6 +924,23 @@ class WorkflowGenerator:
                 "# Existing config to preserve unless the instruction changes it\n\n"
                 f"{json.dumps(existing_data, ensure_ascii=False, separators=(',', ':'))}\n\n"
             )
+        # Progressive tool loading: only once the planner has committed to a
+        # concrete tool do we resolve its real parameter schema (one lazy
+        # daemon lookup per tool). When it resolves, the tool node builder gets
+        # the tool's actual parameter contract INSTEAD of the generic catalogue
+        # line; when it doesn't (no resolver, unknown pair, daemon error) we
+        # fall back to the catalogue section — identical to the pre-schema path.
+        tool_section = ""
+        schema = None
+        if node_type == BuiltinNodeTypes.TOOL:
+            if tool_schema_resolver is not None:
+                schema = tool_schema_resolver(
+                    str(target_node.get("provider") or ""),
+                    str(target_node.get("tool") or ""),
+                )
+            tool_section = format_tool_schema_section(schema) if schema else format_node_tool_catalogue_section(
+                tool_catalogue_text
+            )
         user_prompt = NODE_BUILDER_USER_PROMPT.format(
             node_id=node_id,
             node_type=node_type,
@@ -921,11 +950,12 @@ class WorkflowGenerator:
             ideal_output_section=format_ideal_output_section(ideal_output),
             mode_section=mode_section,
             model_section=model_section,
-            tool_catalogue_section=(
-                format_node_tool_catalogue_section(tool_catalogue_text) if node_type == BuiltinNodeTypes.TOOL else ""
-            ),
+            tool_catalogue_section=tool_section,
             start_inputs_section=(
                 format_start_inputs_section(start_inputs) if node_type == BuiltinNodeTypes.START else ""
+            ),
+            variable_contract_section=format_variable_contract_section(
+                target_node.get("inputs"), target_node.get("outputs")
             ),
             existing_config_section=existing_config_section,
             plan_json=plan_json,
@@ -942,6 +972,21 @@ class WorkflowGenerator:
         config = parsed.get("config")
         if not isinstance(config, dict):
             raise _StageSchemaError(f"Builder {node_id}", "missing 'config' object")
+
+        # Provider identity is authoritative from the resolved schema, NOT from
+        # the LLM: models routinely truncate the 3-segment plugin provider id
+        # (``langgenius/github/github`` → ``langgenius/github``), which then
+        # fails Dify's ``ToolProviderID`` parse at draft-sync time ("Invalid
+        # plugin id") and crashes the canvas. Overwrite the four identity fields
+        # with the schema's exact values so a mis-filled id can never ship.
+        if node_type == BuiltinNodeTypes.TOOL and schema:
+            config["provider_id"] = schema["provider_id"]
+            config["provider_name"] = schema["provider_id"]
+            config["provider_type"] = schema["provider_type"]
+            config["tool_name"] = schema["tool_name"]
+            if schema.get("tool_label"):
+                config.setdefault("tool_label", schema["tool_label"])
+
         return cast(dict[str, Any], config)
 
     @classmethod
@@ -1048,10 +1093,27 @@ class WorkflowGenerator:
                 )
 
         edges: list[dict[str, Any]] = []
+        # A container (iteration / loop) must NOT connect directly to its own
+        # child: the inner entry is the synthetic ``<container>start`` node. The
+        # planner nonetheless sometimes emits ``container -> firstChild`` (often
+        # with a bogus ``iterator`` handle), which is an illegal topology that
+        # breaks the canvas render for the whole subgraph. Drop those — the
+        # entry edge is synthesized below from ``<container>start``.
+        child_to_parent = {child: parent for parent, kids in children_by_parent.items() for child in kids}
         for planned_edge in plan_edges:
+            src = str(planned_edge.get("source") or "")
+            tgt = str(planned_edge.get("target") or "")
+            if src in children_by_parent and child_to_parent.get(tgt) == src:
+                logger.info(
+                    "Workflow generator: dropped illegal container->child edge %s -> %s (entry is %sstart)",
+                    src,
+                    tgt,
+                    src,
+                )
+                continue
             edge: dict[str, Any] = {
-                "source": str(planned_edge.get("source") or ""),
-                "target": str(planned_edge.get("target") or ""),
+                "source": src,
+                "target": tgt,
             }
             source_handle = planned_edge.get("source_handle") or planned_edge.get("sourceHandle")
             target_handle = planned_edge.get("target_handle") or planned_edge.get("targetHandle")
@@ -1850,41 +1912,78 @@ class WorkflowGenerator:
         handle, which renders as an edge hanging off a handle that doesn't
         exist and the branch silently never runs.
 
-        Repair only when unambiguous: default-handle edges are assigned to the
-        node's UNUSED branch handles in declaration order, and only when there
-        are at least as many unused handles as edges to fix. Anything
-        ambiguous is left alone — a wrong guess that swaps the IF and ELSE
-        arms is worse than a visible dangling edge.
+        Two repairs, in order:
+          1. NAME→ID: an edge whose ``sourceHandle`` matches a branch's
+             human-readable *name* (e.g. classifier class name "Urgent Bug",
+             if-else case name "IF") instead of its *id* ("1", "true") is
+             rewritten to the id. This is the dominant real failure — the LLM
+             labels the edge with the class name it just wrote, but the canvas
+             handle is keyed on the id, so the edge dangles and the whole
+             branch subtree renders disconnected.
+          2. DEFAULT→UNUSED: default-handle edges are assigned to the node's
+             UNUSED branch handles in declaration order, only when there are at
+             least as many unused handles as edges to fix. Anything ambiguous is
+             left alone — a wrong guess that swaps the IF and ELSE arms is worse
+             than a visible dangling edge.
         """
         for node in nodes:
             data = node.get("data") or {}
             node_type = data.get("type")
+            # ``name_to_id`` maps a branch's human name → its handle id, so an
+            # edge mistakenly keyed on the name can be corrected.
+            name_to_id: dict[str, str] = {}
             if node_type == BuiltinNodeTypes.IF_ELSE:
-                branch_handles = [
-                    str(case["case_id"])
-                    for case in (data.get("cases") or [])
-                    if isinstance(case, dict) and case.get("case_id")
-                ]
+                branch_handles = []
+                for case in data.get("cases") or []:
+                    if isinstance(case, dict) and case.get("case_id"):
+                        cid = str(case["case_id"])
+                        branch_handles.append(cid)
+                        name = str(case.get("case_name") or case.get("name") or "").strip()
+                        if name:
+                            name_to_id[name] = cid
                 # ELSE is implicit — it has a handle even though no case
                 # declares it.
                 branch_handles.append("false")
+                name_to_id.setdefault("ELSE", "false")
+                name_to_id.setdefault("else", "false")
             elif node_type == BuiltinNodeTypes.QUESTION_CLASSIFIER:
-                branch_handles = [
-                    str(klass["id"])
-                    for klass in (data.get("classes") or [])
-                    if isinstance(klass, dict) and klass.get("id")
-                ]
+                branch_handles = []
+                for klass in data.get("classes") or []:
+                    if isinstance(klass, dict) and klass.get("id"):
+                        kid = str(klass["id"])
+                        branch_handles.append(kid)
+                        name = str(klass.get("name") or "").strip()
+                        if name:
+                            name_to_id[name] = kid
             elif node_type == BuiltinNodeTypes.HUMAN_INPUT:
-                branch_handles = [
-                    str(action["id"])
-                    for action in (data.get("user_actions") or [])
-                    if isinstance(action, dict) and action.get("id")
-                ]
+                branch_handles = []
+                for action in data.get("user_actions") or []:
+                    if isinstance(action, dict) and action.get("id"):
+                        aid = str(action["id"])
+                        branch_handles.append(aid)
+                        name = str(action.get("title") or action.get("name") or "").strip()
+                        if name:
+                            name_to_id[name] = aid
             else:
                 continue
 
             node_id = node.get("id")
             outgoing = [e for e in edges if e.get("source") == node_id]
+
+            # Repair 1: rewrite name-keyed handles to their id. Only rewrite a
+            # handle that is NOT already a valid id but IS a known branch name.
+            for edge in outgoing:
+                handle = edge.get("sourceHandle")
+                if isinstance(handle, str) and handle not in branch_handles and handle in name_to_id:
+                    edge["sourceHandle"] = name_to_id[handle]
+                    logger.info(
+                        "Workflow generator: rewrote branch edge handle %r -> %r on node %s",
+                        handle,
+                        name_to_id[handle],
+                        node_id,
+                    )
+
+            # Repair 2: default-handle edges → unused branch handles.
             taken = {e.get("sourceHandle") for e in outgoing if e.get("sourceHandle") in branch_handles}
             unused = [h for h in branch_handles if h not in taken]
             defaulted = [e for e in outgoing if e.get("sourceHandle") in (None, "", "source")]

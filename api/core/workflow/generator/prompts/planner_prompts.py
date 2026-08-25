@@ -67,7 +67,11 @@ minimum set of Dify workflow nodes needed to fulfil it, in execution order.
 6. Each node "label" must be a short, human-readable, Title-Case name (≤ 25 chars).
 7. Each node "purpose" is one sentence explaining what it does in this workflow.
    For "tool" nodes, name the chosen tool inside the purpose, e.g.
-   "Search the web using google/search.".
+   "Search the web using google/search.". ADDITIONALLY, for every "tool" node
+   you MUST emit two structured fields copied verbatim from the "Available
+   tools" list: ``"provider"`` (the provider portion, e.g. "langgenius/google")
+   and ``"tool"`` (the tool portion, e.g. "google_search"). These let the
+   builder load the tool's real parameter schema. Only "tool" nodes carry them.
 8. For "iteration" and "loop" nodes (containers), list the container node first
    and then EACH inner-pipeline step as its own entry tagged with
    ``"parent": "<container-label>"``. Container children execute in declaration
@@ -78,6 +82,13 @@ minimum set of Dify workflow nodes needed to fulfil it, in execution order.
        {"label": "Store Item", "node_type": "code", "purpose": "...",
         "parent": "Per Item"}
    Nodes without a ``"parent"`` are top-level.
+   CONTAINER EDGE RULES (critical): do NOT emit any edge from the container
+   node to its own children — the container's inner steps start automatically
+   from its auto-generated start node. Edges you emit for a container are only:
+   (a) an edge INTO the container node from its upstream sibling, and (b) an
+   edge OUT of the container node to its downstream sibling. Edges BETWEEN
+   children (same parent) are fine. Never write ``{"source": "<container>",
+   "target": "<its child>"}``.
 9. Pick a short, human-readable ``app_name`` (≤ 30 chars, Title Case) and
    exactly ONE ``icon`` emoji that captures the workflow's purpose at a
    glance — these are used as the App's display name and icon when the user
@@ -119,6 +130,27 @@ minimum set of Dify workflow nodes needed to fulfil it, in execution order.
     result), "advanced-chat" for conversational multi-turn assistants. The
     terminal node must match the chosen mode (rule 2): "end" for workflow,
     "answer" for advanced-chat.
+16. DECLARE THE VARIABLE WIRING so every node agrees on names (the node
+    builders run in parallel and cannot see each other's output). For each
+    non-start node add an ``inputs`` array listing every upstream value it
+    consumes as ``[["<src-node-id>", "<var>"], ...]``. The ``<var>`` MUST be a
+    real output of that source node:
+      - start                → one of its ``start_inputs`` variable names
+      - llm                  → "text"
+      - tool                 → "text" (also "files" / "json" when relevant)
+      - knowledge-retrieval  → "result"
+      - question-classifier  → "class_name" (or "class_id")
+      - template-transform / variable-aggregator / iteration / loop → "output"
+      - document-extractor   → "text"
+      - http-request         → one of "body" / "status_code" / "headers"
+      - parameter-extractor  → one of the parameter names you list in its config
+      - code                 → one of the output keys you define
+    Only ``code`` and ``parameter-extractor`` have custom output names — for
+    those, ALSO add an ``outputs`` array naming the variables they expose (e.g.
+    ``"outputs": ["urls", "count"]``) so downstream nodes reference the same
+    names. Every other node's outputs are fixed (above) — do NOT invent new
+    output names for them. In Advanced-Chat mode ``["sys","query"]`` /
+    ``["sys","files"]`` are always valid inputs.
 
 # Output schema
 
@@ -133,8 +165,13 @@ minimum set of Dify workflow nodes needed to fulfil it, in execution order.
   ],
   "nodes": [
     {"id": "node1", "label": "Start",     "node_type": "start", "purpose": "..."},
-    {"id": "node2", "label": "Summarize", "node_type": "llm",   "purpose": "..."},
-    {"id": "node3", "label": "End",       "node_type": "end",   "purpose": "..."}
+    {"id": "node2", "label": "Web Search", "node_type": "tool", "purpose": "Search the web.",
+     "provider": "langgenius/google", "tool": "google_search",
+     "inputs": [["node1", "url"]]},
+    {"id": "node3", "label": "Summarize", "node_type": "llm",   "purpose": "...",
+     "inputs": [["node2", "text"]]},
+    {"id": "node4", "label": "End",       "node_type": "end",   "purpose": "...",
+     "inputs": [["node3", "text"]]}
   ],
   "edges": [
     {"source": "node1", "target": "node2"},

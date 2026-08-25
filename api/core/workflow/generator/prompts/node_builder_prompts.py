@@ -56,7 +56,7 @@ purpose={purpose}
 
 {instruction}
 
-{ideal_output_section}{mode_section}{model_section}{tool_catalogue_section}{start_inputs_section}{existing_config_section}\
+{ideal_output_section}{mode_section}{model_section}{tool_catalogue_section}{start_inputs_section}{variable_contract_section}{existing_config_section}\
 # Normalized plan and topology
 
 {plan_json}
@@ -126,6 +126,45 @@ def format_start_inputs_section(start_inputs: list[dict[str, Any]]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def format_variable_contract_section(inputs: "list[Any] | None", outputs: "list[Any] | None") -> str:
+    """Render the planner-declared variable wiring for one target node.
+
+    The planner (rule 16) declares, per node, which upstream values it consumes
+    (``inputs``: ``[[src_id, var], ...]``) and — for custom-output nodes — which
+    variables it exposes (``outputs``). Surfacing this to the builder makes the
+    parallel builders agree on names instead of each guessing an upstream output
+    (the dominant source of unresolved ``{{#node.var#}}`` references). Returns ""
+    when the planner declared nothing (older prompts), so behaviour degrades to
+    the previous guess-and-repair path.
+    """
+    lines: list[str] = []
+    ref_pairs = [
+        p for p in (inputs or [])
+        if isinstance(p, (list, tuple)) and len(p) == 2 and all(isinstance(x, str) and x.strip() for x in p)
+    ]
+    if ref_pairs:
+        lines.append("# Variable contract — reference ONLY these upstream outputs")
+        lines.append("")
+        lines.append(
+            "When you reference an upstream value (placeholder {{#src.var#}} or "
+            'selector ["src", "var"]) use EXACTLY these source ids and variable '
+            "names. Do NOT invent other names:"
+        )
+        for src, var in ref_pairs:
+            lines.append(f'- {{{{#{src}.{var}#}}}}   (selector: [{src!r}, {var!r}])')
+        lines.append("")
+    out_names = [str(o) for o in (outputs or []) if isinstance(o, str) and o.strip()]
+    if out_names:
+        lines.append(
+            "This node MUST expose exactly these output variable names so downstream "
+            f"nodes resolve: {', '.join(out_names)}. Define them in the config accordingly."
+        )
+        lines.append("")
+    if not lines:
+        return ""
+    return "\n".join(lines) + "\n"
+
+
 def format_tool_catalogue_section(catalogue_text: str) -> str:
     """Render exact tool identifiers for a tool-node builder only."""
     if not catalogue_text.strip():
@@ -136,3 +175,84 @@ def format_tool_catalogue_section(catalogue_text: str) -> str:
         "tool_name to the tool portion)\n\n"
         f"{catalogue_text}\n\n"
     )
+
+
+def format_tool_schema_section(schema: "dict[str, Any] | None") -> str:
+    """Render one resolved tool's real parameter schema for its node builder.
+
+    Progressive loading: the planner picked a concrete ``provider`` / ``tool``
+    from the lightweight catalogue; here — only for that chosen tool — we inject
+    its actual parameter list (names, types, required flags, options) so the
+    builder fills ``tool_parameters`` against the real contract instead of
+    guessing. Returns "" when the schema couldn't be resolved, in which case the
+    builder falls back to the generic ``tool`` template in ``_NODE_SNIPPETS``.
+
+    ``schema`` is a ``ToolSchemaInfo`` dict (see
+    ``core.workflow.generator.tool_schema``). Only ``form == "form"`` parameters
+    need a value in the node; ``form == "llm"`` ones are listed so the builder
+    knows to leave them for the run time.
+    """
+    if not schema:
+        return ""
+
+    provider_id = str(schema.get("provider_id") or "")
+    provider_type = str(schema.get("provider_type") or "builtin")
+    tool_name = str(schema.get("tool_name") or "")
+    tool_label = str(schema.get("tool_label") or tool_name)
+    parameters = schema.get("parameters") or []
+
+    lines = [
+        "# Selected tool schema (fill tool_parameters against THIS contract)",
+        "",
+        f"provider_id={provider_id!r}  provider_type={provider_type!r}  "
+        f"tool_name={tool_name!r}  tool_label={tool_label!r}",
+        "",
+        "Set the node's provider_id, provider_name, provider_type, tool_name and "
+        "tool_label to exactly these values. provider_type MUST be the value above "
+        f"({provider_type!r}) — do not hard-code 'builtin' for a plugin tool.",
+        "",
+    ]
+
+    form_params = [p for p in parameters if p.get("form") == "form"]
+    llm_params = [p for p in parameters if p.get("form") == "llm"]
+
+    if form_params:
+        lines.append("Parameters you MUST provide in tool_parameters (form params):")
+        for p in form_params:
+            lines.append(_render_param_line(p))
+        lines.append("")
+        lines.append(
+            "For each: use {\"type\":\"mixed\",\"value\":\"...{{#src.var#}}...\"} for a "
+            "string template, {\"type\":\"variable\",\"value\":[\"src\",\"var\"]} for a "
+            "direct reference, or {\"type\":\"constant\",\"value\":<literal>} for a fixed "
+            "value. Only include a required param you cannot fill from an upstream "
+            "output as a constant."
+        )
+        lines.append("")
+    else:
+        lines.append("This tool has no form parameters to fill; tool_parameters may be {}.")
+        lines.append("")
+
+    if llm_params:
+        names = ", ".join(str(p.get("name")) for p in llm_params)
+        lines.append(f"Run-time (LLM-filled) params — do NOT put these in tool_parameters: {names}")
+        lines.append("")
+
+    return "\n".join(lines) + "\n"
+
+
+def _render_param_line(param: "dict[str, Any]") -> str:
+    """One bullet describing a single form parameter for the builder."""
+    name = str(param.get("name") or "")
+    ptype = str(param.get("type") or "")
+    required = "required" if param.get("required") else "optional"
+    parts = [f"- {name} ({ptype}, {required})"]
+    desc = str(param.get("description") or "").strip()
+    if desc:
+        parts.append(f": {desc}")
+    if param.get("options"):
+        opts = ", ".join(str(o) for o in param["options"])
+        parts.append(f" [options: {opts}]")
+    if "default" in param:
+        parts.append(f" [default: {param['default']!r}]")
+    return "".join(parts)

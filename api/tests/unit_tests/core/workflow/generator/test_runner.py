@@ -1091,6 +1091,35 @@ class TestAssembleParallelGraph:
         entry = next(edge for edge in graph["edges"] if edge["source"] == "itstart")
         assert entry["target"] == "a"
 
+    def test_drops_illegal_container_to_child_edge(self):
+        # The planner sometimes emits ``container -> firstChild`` (an illegal
+        # topology — the inner entry is the synthetic ``<container>start``). The
+        # assembler must drop it and synthesize the entry from ``itstart``
+        # instead, otherwise the canvas render breaks for the whole subgraph.
+        plan_nodes = [
+            {"id": "it", "label": "Per Item", "node_type": "iteration", "purpose": "x"},
+            {"id": "a", "label": "A", "node_type": "llm", "purpose": "x", "parent": "Per Item"},
+            {"id": "b", "label": "B", "node_type": "llm", "purpose": "x", "parent": "Per Item"},
+        ]
+
+        graph = WorkflowGenerator._assemble_parallel_graph(
+            plan_nodes=plan_nodes,
+            plan_edges=[
+                {"source": "it", "target": "a", "source_handle": "iterator"},  # illegal
+                {"source": "a", "target": "b"},
+            ],
+            configs_by_id={"it": {}, "a": {}, "b": {}},
+            existing_by_id={},
+            existing_edges=[],
+        )
+
+        # The illegal container->child edge must be gone.
+        assert not any(e["source"] == "it" and e["target"] == "a" for e in graph["edges"])
+        # The synthetic entry edge from itstart must exist instead.
+        assert any(e["source"] == "itstart" and e["target"] == "a" for e in graph["edges"])
+        # The legitimate inner edge survives.
+        assert any(e["source"] == "a" and e["target"] == "b" for e in graph["edges"])
+
 
 class TestSoleDeclaredVariable:
     """Human-input output inference feeds the variable-reference reconciler."""
@@ -3858,6 +3887,74 @@ class TestWorkflowGeneratorBranchHandleRepair:
         WorkflowGenerator._repair_branch_edge_handles(nodes=nodes, edges=edges)
 
         assert edges[0]["sourceHandle"] == "source"
+
+    def test_classifier_edge_handle_by_class_name_is_rewritten_to_id(self):
+        # The dominant real failure: the builder labels each branch edge with
+        # the class NAME it just wrote ("Urgent Bug"), but the canvas handle is
+        # keyed on the class id ("1"). Left unfixed the whole branch subtree
+        # renders disconnected. The repair rewrites name → id.
+        nodes = [
+            {
+                "id": "qc",
+                "data": {
+                    "type": "question-classifier",
+                    "classes": [
+                        {"id": "1", "name": "Urgent Bug"},
+                        {"id": "2", "name": "General Bug"},
+                        {"id": "3", "name": "Feature Request"},
+                    ],
+                },
+            }
+        ]
+        edges = [
+            {"source": "qc", "target": "n7", "sourceHandle": "Urgent Bug"},
+            {"source": "qc", "target": "n8", "sourceHandle": "General Bug"},
+            {"source": "qc", "target": "n8b", "sourceHandle": "Feature Request"},
+        ]
+
+        WorkflowGenerator._repair_branch_edge_handles(nodes=nodes, edges=edges)
+
+        assert edges[0]["sourceHandle"] == "1"
+        assert edges[1]["sourceHandle"] == "2"
+        assert edges[2]["sourceHandle"] == "3"
+
+    def test_if_else_case_name_and_else_are_rewritten_to_ids(self):
+        nodes = [
+            {
+                "id": "branch",
+                "data": {
+                    "type": "if-else",
+                    "cases": [{"case_id": "true", "case_name": "IF", "conditions": []}],
+                },
+            }
+        ]
+        edges = [
+            {"source": "branch", "target": "a", "sourceHandle": "IF"},
+            {"source": "branch", "target": "b", "sourceHandle": "ELSE"},
+        ]
+
+        WorkflowGenerator._repair_branch_edge_handles(nodes=nodes, edges=edges)
+
+        assert edges[0]["sourceHandle"] == "true"
+        assert edges[1]["sourceHandle"] == "false"
+
+    def test_valid_id_handle_is_not_mistaken_for_a_name(self):
+        # A handle that is already a valid id must be left as-is even if some
+        # class name coincidentally collides — ids take precedence.
+        nodes = [
+            {
+                "id": "qc",
+                "data": {
+                    "type": "question-classifier",
+                    "classes": [{"id": "1", "name": "A"}, {"id": "2", "name": "B"}],
+                },
+            }
+        ]
+        edges = [{"source": "qc", "target": "a", "sourceHandle": "1"}]
+
+        WorkflowGenerator._repair_branch_edge_handles(nodes=nodes, edges=edges)
+
+        assert edges[0]["sourceHandle"] == "1"
 
 
 class TestWorkflowGeneratorGraphCycleValidation:

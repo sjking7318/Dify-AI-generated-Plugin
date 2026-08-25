@@ -63,6 +63,23 @@ class PlannerNodeDict(TypedDict):
     purpose: str
     parent: NotRequired[str]
     action: NotRequired[Literal["keep", "update", "add"]]
+    # For ``tool`` nodes only: the concrete installed tool the planner picked
+    # from the catalogue. ``provider`` is the exact provider identifier
+    # (e.g. "langgenius/google" for a plugin, "time" for a built-in) and
+    # ``tool`` is the tool name within it. The runner uses this pair to resolve
+    # the tool's real parameter schema before the builder configures the node.
+    # Optional: older prompts / non-tool nodes omit it, and the builder then
+    # falls back to the generic tool template.
+    provider: NotRequired[str]
+    tool: NotRequired[str]
+    # Variable wiring the planner declares so parallel node builders agree on
+    # names. ``inputs`` is the list of upstream values this node consumes, each
+    # a ``[src_node_id, var]`` pair. ``outputs`` is only meaningful for nodes
+    # with custom output names (``code`` / ``parameter-extractor``); every other
+    # node type has fixed outputs the runner derives. Both optional — older
+    # prompts omit them and the runner falls back to its heuristic repair.
+    inputs: NotRequired[list[list[str]]]
+    outputs: NotRequired[list[str]]
 
 
 class PlannerEdgeDict(TypedDict):

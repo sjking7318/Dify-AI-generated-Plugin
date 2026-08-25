@@ -113,7 +113,7 @@ _NODE_SNIPPETS: dict[str, str] = {
     "tool": """\
 - tool  (PREFERRED for external actions when listed in Available tools):
     {"provider_id": "<provider>",            # provider portion of provider/tool
-     "provider_type": "builtin",             # exact value from catalogue
+     "provider_type": "builtin",             # "plugin" for plugin tools, "builtin" for built-ins
      "provider_name": "<provider>",          # usually same as provider_id
      "tool_name": "<tool>",                  # tool portion of provider/tool
      "tool_label": "<Tool>",
@@ -121,6 +121,9 @@ _NODE_SNIPPETS: dict[str, str] = {
      "tool_configurations": {},
      "tool_parameters": {"<param>": {"type": "mixed",
                                      "value": "{{#<src>.<var>#}}"}}}
+    If a "Selected tool schema" section is present, copy provider_id /
+    provider_type / provider_name / tool_name / tool_label from it verbatim and
+    fill tool_parameters against the listed form parameters only.
     Parameter ``type`` is one of:
       "mixed"    — string template referencing variables ({{#...#}})
       "variable" — direct reference, value is ["<src>", "<var>"]

@@ -27,6 +27,7 @@ from core.helper.workflow_copilot_cache import CachedCopilotMessage, WorkflowCop
 from core.model_manager import ModelManager
 from core.workflow.generator import WorkflowGenerator
 from core.workflow.generator.tool_catalogue import build_tool_catalogue, format_tool_catalogue, installed_tool_keys
+from core.workflow.generator.tool_schema import build_tool_schema_resolver
 from core.workflow.generator.types import WorkflowGenerateResultDict, WorkflowGenerationMode
 from extensions.ext_database import db
 from graphon.model_runtime.entities.model_entities import ModelType
@@ -295,10 +296,12 @@ class WorkflowCopilotService:
 
         tool_catalogue_text = ""
         installed_tools: set[tuple[str, str]] | None = None
+        tool_schema_resolver = None
         try:
             entries = build_tool_catalogue(tenant_id)
             tool_catalogue_text = format_tool_catalogue(entries)
             installed_tools = installed_tool_keys(entries)
+            tool_schema_resolver = build_tool_schema_resolver(tenant_id, entries)
         except Exception:
             logger.exception("Workflow copilot: failed to build tool catalogue for tenant %s", tenant_id)
 
@@ -312,6 +315,7 @@ class WorkflowCopilotService:
             instruction=instruction,
             tool_catalogue_text=tool_catalogue_text,
             installed_tools=installed_tools,
+            tool_schema_resolver=tool_schema_resolver,
             current_graph=current_graph,
         )
 
